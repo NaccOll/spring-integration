@@ -27,11 +27,15 @@ import java.util.Map.Entry;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.locks.Condition;
@@ -302,6 +306,11 @@ public final class RedisLockRegistry implements ExpirableLockRegistry, Disposabl
 		SPIN_LOCK,
 
 		/**
+		 * The lock is acquired by periodically(idleBetweenTries property) checking whether the lock can be acquired and schedule renewal expire time
+		 */
+		SPIN_LOCK_WITH_RENEWAL,
+
+		/**
 		 * The lock is acquired by redis pub-sub subscription.
 		 */
 		PUB_SUB_LOCK
@@ -311,6 +320,7 @@ public final class RedisLockRegistry implements ExpirableLockRegistry, Disposabl
 		return switch (redisLockType) {
 			case SPIN_LOCK -> RedisSpinLock::new;
 			case PUB_SUB_LOCK -> RedisPubSubLock::new;
+			case SPIN_LOCK_WITH_RENEWAL -> RedisSpinLockWithRenewal::new;
 		};
 	}
 
@@ -724,7 +734,7 @@ public final class RedisLockRegistry implements ExpirableLockRegistry, Disposabl
 
 	}
 
-	private final class RedisSpinLock extends RedisLock {
+	private class RedisSpinLock extends RedisLock {
 
 		private static final String UNLINK_UNLOCK_SCRIPT = """
 				local lockClientId = redis.call('GET', KEYS[1])
@@ -787,6 +797,178 @@ public final class RedisLockRegistry implements ExpirableLockRegistry, Disposabl
 			return Boolean.TRUE.equals(RedisLockRegistry.this.redisTemplate.execute(
 					redisScript, Collections.singletonList(this.lockKey),
 					RedisLockRegistry.this.clientId));
+		}
+
+	}
+
+	public final class RedisSpinLockWithRenewal extends RedisSpinLock {
+
+		private static final ConcurrentMap<String, ExpirationEntry> EXPIRATION_RENEWAL_MAP = new ConcurrentHashMap<>();
+
+		private static final ScheduledExecutorService scheduledExecutorService = new ScheduledThreadPoolExecutor(10,
+				new CustomizableThreadFactory("redis-lock-renewal-schedule"));
+
+		private static final String RENEW_SCRIPT = """
+				if (redis.call('GET', KEYS[1]) == ARGV[2]) then
+					redis.call('PEXPIRE', KEYS[1], ARGV[1])
+					return true
+				end
+				return false
+				""";
+
+		public static final RedisScript<Boolean>
+				RENEW_REDIS_SCRIPT = new DefaultRedisScript<>(RENEW_SCRIPT, Boolean.class);
+
+		private RedisSpinLockWithRenewal(String path) {
+			super(path);
+		}
+
+		@Override
+		protected boolean tryRedisLockInner(long time) throws InterruptedException {
+			boolean res = super.tryRedisLockInner(time);
+			if (res) {
+				scheduleExpirationRenewal(Thread.currentThread().getId());
+			}
+			return res;
+		}
+
+		@Override
+		protected boolean removeLockKeyInnerUnlink() {
+			boolean result = super.removeLockKeyInnerUnlink();
+			if (result) {
+				cancelExpirationRenewal(Thread.currentThread().getId());
+			}
+			return result;
+		}
+
+		@Override
+		protected boolean removeLockKeyInnerDelete() {
+			boolean result = super.removeLockKeyInnerDelete();
+			if (result) {
+				cancelExpirationRenewal(Thread.currentThread().getId());
+			}
+			return result;
+		}
+
+		protected void scheduleExpirationRenewal(long threadId) {
+			ExpirationEntry entry = new ExpirationEntry();
+			ExpirationEntry oldEntry = EXPIRATION_RENEWAL_MAP.putIfAbsent(lockKey, entry);
+			if (oldEntry != null) {
+				oldEntry.addThreadId(threadId);
+			}
+			else {
+				entry.addThreadId(threadId);
+				renewExpiration();
+			}
+		}
+
+		private void renewExpiration() {
+			ExpirationEntry ee = EXPIRATION_RENEWAL_MAP.get(lockKey);
+			if (ee == null) {
+				return;
+			}
+			Runnable task = () -> {
+				ExpirationEntry ent = EXPIRATION_RENEWAL_MAP.get(lockKey);
+				if (ent == null) {
+					return;
+				}
+				Long threadId = ent.getFirstThreadId();
+				if (threadId == null) {
+					return;
+				}
+
+				boolean res = renewKeyWithScript(RENEW_REDIS_SCRIPT);
+				if (res) {
+					renewExpiration();
+				}
+				else {
+					EXPIRATION_RENEWAL_MAP.remove(lockKey);
+				}
+
+			};
+			ScheduledFuture<?> timeout = scheduledExecutorService.schedule(task, RedisLockRegistry.this.expireAfter / 3,
+					TimeUnit.MILLISECONDS);
+			ee.setTimeout(timeout);
+		}
+
+		private void cancelExpirationRenewal(Long threadId) {
+			ExpirationEntry task = EXPIRATION_RENEWAL_MAP.get(lockKey);
+			if (task == null) {
+				return;
+			}
+
+			if (threadId != null) {
+				task.removeThreadId(threadId);
+			}
+
+			if (threadId == null || task.hasNoThreads()) {
+				ScheduledFuture<?> timeout = task.getTimeout();
+				if (timeout != null) {
+					timeout.cancel(true);
+				}
+				EXPIRATION_RENEWAL_MAP.remove(lockKey);
+			}
+		}
+
+		public boolean renewKeyWithScript(RedisScript<Boolean> redisScript) {
+			return Boolean.TRUE.equals(RedisLockRegistry.this.redisTemplate.execute(
+					redisScript, Collections.singletonList(this.lockKey), String.valueOf(RedisLockRegistry.this.expireAfter),
+					RedisLockRegistry.this.clientId));
+		}
+
+		static class ExpirationEntry {
+
+			private final Map<Long, Integer> threadIds = new LinkedHashMap<>();
+
+			private ScheduledFuture<?> timeout;
+
+			ExpirationEntry() {
+				super();
+			}
+
+			public synchronized void addThreadId(long threadId) {
+				Integer counter = this.threadIds.get(threadId);
+				if (counter == null) {
+					counter = 1;
+				}
+				else {
+					counter++;
+				}
+				this.threadIds.put(threadId, counter);
+			}
+
+			public synchronized boolean hasNoThreads() {
+				return this.threadIds.isEmpty();
+			}
+
+			public synchronized Long getFirstThreadId() {
+				if (this.threadIds.isEmpty()) {
+					return null;
+				}
+				return this.threadIds.keySet().iterator().next();
+			}
+
+			public synchronized void removeThreadId(long threadId) {
+				Integer counter = this.threadIds.get(threadId);
+				if (counter == null) {
+					return;
+				}
+				counter--;
+				if (counter == 0) {
+					this.threadIds.remove(threadId);
+				}
+				else {
+					this.threadIds.put(threadId, counter);
+				}
+			}
+
+			public ScheduledFuture<?> getTimeout() {
+				return this.timeout;
+			}
+
+			public void setTimeout(ScheduledFuture<?> timeout) {
+				this.timeout = timeout;
+			}
 		}
 
 	}

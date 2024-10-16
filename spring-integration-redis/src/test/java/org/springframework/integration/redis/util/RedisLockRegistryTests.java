@@ -118,7 +118,7 @@ class RedisLockRegistryTests implements RedisContainerTest {
 	}
 
 	@ParameterizedTest
-	@EnumSource(RedisLockType.class)
+	@EnumSource(value = RedisLockType.class, mode = EnumSource.Mode.EXCLUDE, names = {"SPIN_LOCK_WITH_RENEWAL"})
 	void testUnlockAfterLockStatusHasBeenExpired(RedisLockType testRedisLockType) throws InterruptedException {
 		RedisLockRegistry registry = new RedisLockRegistry(redisConnectionFactory, this.registryKey, 100);
 		registry.setRedisLockType(testRedisLockType);
@@ -396,7 +396,7 @@ class RedisLockRegistryTests implements RedisContainerTest {
 	}
 
 	@ParameterizedTest
-	@EnumSource(RedisLockType.class)
+	@EnumSource(value = RedisLockType.class, mode = EnumSource.Mode.EXCLUDE, names = {"SPIN_LOCK_WITH_RENEWAL"})
 	void testExpireTwoRegistries(RedisLockType testRedisLockType) throws Exception {
 		RedisLockRegistry registry1 = new RedisLockRegistry(redisConnectionFactory, this.registryKey, 100);
 		registry1.setRedisLockType(testRedisLockType);
@@ -424,6 +424,25 @@ class RedisLockRegistryTests implements RedisContainerTest {
 		assertThatThrownBy(lock1::unlock)
 				.isInstanceOf(ConcurrentModificationException.class)
 				.hasMessageContaining("Lock was released in the store due to expiration.");
+		registry.destroy();
+	}
+
+	@ParameterizedTest
+	@EnumSource(RedisLockType.class)
+	void testRenewalOnExpire(RedisLockType redisLockType) throws Exception {
+		RedisLockRegistry registry = new RedisLockRegistry(redisConnectionFactory, this.registryKey, 3_000L);
+		registry.setRedisLockType(redisLockType);
+		Lock lock1 = registry.obtain("foo");
+		assertThat(lock1.tryLock()).isTrue();
+		waitForExpire2("foo");
+		if (redisLockType == RedisLockType.SPIN_LOCK_WITH_RENEWAL) {
+			lock1.unlock();
+		}
+		else {
+			assertThatThrownBy(lock1::unlock)
+					.isInstanceOf(ConcurrentModificationException.class)
+					.hasMessageContaining("Lock was released in the store due to expiration.");
+		}
 		registry.destroy();
 	}
 
@@ -920,6 +939,14 @@ class RedisLockRegistryTests implements RedisContainerTest {
 			Thread.sleep(100);
 		}
 		assertThat(n < 100).as(key + " key did not expire").isTrue();
+	}
+
+	private void waitForExpire2(String key) throws Exception {
+		StringRedisTemplate template = createTemplate();
+		int n = 0;
+		while (n++ < 50 && template.keys(this.registryKey + ":" + key).size() > 0) {
+			Thread.sleep(100);
+		}
 	}
 
 	@SuppressWarnings("unchecked")
