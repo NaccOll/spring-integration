@@ -29,6 +29,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -51,6 +52,7 @@ import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.integration.redis.RedisContainerTest;
 import org.springframework.integration.redis.util.RedisLockRegistry.RedisLockType;
 import org.springframework.integration.test.util.TestUtils;
+import org.springframework.scheduling.concurrent.CustomizableThreadFactory;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatNoException;
@@ -118,7 +120,7 @@ class RedisLockRegistryTests implements RedisContainerTest {
 	}
 
 	@ParameterizedTest
-	@EnumSource(value = RedisLockType.class, mode = EnumSource.Mode.EXCLUDE, names = {"SPIN_LOCK_WITH_RENEWAL"})
+	@EnumSource(RedisLockType.class)
 	void testUnlockAfterLockStatusHasBeenExpired(RedisLockType testRedisLockType) throws InterruptedException {
 		RedisLockRegistry registry = new RedisLockRegistry(redisConnectionFactory, this.registryKey, 100);
 		registry.setRedisLockType(testRedisLockType);
@@ -396,7 +398,7 @@ class RedisLockRegistryTests implements RedisContainerTest {
 	}
 
 	@ParameterizedTest
-	@EnumSource(value = RedisLockType.class, mode = EnumSource.Mode.EXCLUDE, names = {"SPIN_LOCK_WITH_RENEWAL"})
+	@EnumSource(RedisLockType.class)
 	void testExpireTwoRegistries(RedisLockType testRedisLockType) throws Exception {
 		RedisLockRegistry registry1 = new RedisLockRegistry(redisConnectionFactory, this.registryKey, 100);
 		registry1.setRedisLockType(testRedisLockType);
@@ -431,18 +433,26 @@ class RedisLockRegistryTests implements RedisContainerTest {
 	@EnumSource(RedisLockType.class)
 	void testRenewalOnExpire(RedisLockType redisLockType) throws Exception {
 		RedisLockRegistry registry = new RedisLockRegistry(redisConnectionFactory, this.registryKey, 3_000L);
+		registry.setRenewalScheduledExecutor(new ScheduledThreadPoolExecutor(10, new CustomizableThreadFactory("renewal-schedule-thread")));
 		registry.setRedisLockType(redisLockType);
 		Lock lock1 = registry.obtain("foo");
 		assertThat(lock1.tryLock()).isTrue();
 		waitForExpire2("foo");
-		if (redisLockType == RedisLockType.SPIN_LOCK_WITH_RENEWAL) {
-			lock1.unlock();
-		}
-		else {
-			assertThatThrownBy(lock1::unlock)
-					.isInstanceOf(ConcurrentModificationException.class)
-					.hasMessageContaining("Lock was released in the store due to expiration.");
-		}
+		lock1.unlock();
+		registry.destroy();
+	}
+
+	@ParameterizedTest
+	@EnumSource(RedisLockType.class)
+	void testRenewalExceptionOnExpire(RedisLockType redisLockType) throws Exception {
+		RedisLockRegistry registry = new RedisLockRegistry(redisConnectionFactory, this.registryKey, 3_000L);
+		registry.setRedisLockType(redisLockType);
+		Lock lock1 = registry.obtain("foo");
+		assertThat(lock1.tryLock()).isTrue();
+		waitForExpire2("foo");
+		assertThatThrownBy(lock1::unlock)
+				.isInstanceOf(ConcurrentModificationException.class)
+				.hasMessageContaining("Lock was released in the store due to expiration.");
 		registry.destroy();
 	}
 
